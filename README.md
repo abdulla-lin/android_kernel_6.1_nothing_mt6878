@@ -11,6 +11,9 @@
 4. OS 2.6(Tetris-U2.6-240813-2046)
   - No update
 
+5. OS 2.6(Tetris-U2.6-240910-1735)
+  - No update
+
 # How do I submit patches to Android Common Kernels
 
 1. BEST: Make all of your changes to upstream Linux. If appropriate, backport to the stable releases.
