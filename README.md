@@ -1,3 +1,8 @@
+# CMF by NOTHING Phone 1 Release Note
+1. OS 3.0 (Tetris-V3.0-250111-2249)
+  - First release opensource of kernel and kernel modules
+
+
 # How do I submit patches to Android Common Kernels
 
 1. BEST: Make all of your changes to upstream Linux. If appropriate, backport to the stable releases.
