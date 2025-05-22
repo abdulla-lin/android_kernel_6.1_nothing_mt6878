@@ -2,6 +2,9 @@
 1. OS 3.0 (Tetris-V3.0-250111-2249)
   - First release opensource of kernel and kernel modules
 
+2. OS 3.0 (Tetris-V3.0-250208-2015)
+  - No update
+
 
 # How do I submit patches to Android Common Kernels
 
