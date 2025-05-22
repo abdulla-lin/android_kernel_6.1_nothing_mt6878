@@ -5,6 +5,9 @@
 2. OS 3.0 (Tetris-V3.0-250208-2015)
   - No update
 
+3. OS 3.0 (Tetris-V3.0-250409-1734)
+  - Improve usb/performance
+
 
 # How do I submit patches to Android Common Kernels
 
