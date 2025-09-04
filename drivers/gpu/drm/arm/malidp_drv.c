@@ -227,11 +227,17 @@ static int malidp_init(struct drm_device *drm)
 crtc_fail:
     drm_mode_config_cleanup(drm);
     return ret;
-{
+}
 
 static void malidp_fini(struct drm_device *drm)
 {
-	drm_mode_config_cleanup(drm);
+    drm_mode_config_cleanup(drm);
+
+    /* Remove GPU devfreq device if initialized */
+    if (gpu_devfreq) {
+        devfreq_remove_device(gpu_devfreq);
+        gpu_devfreq = NULL;
+    }
 }
 
 static int malidp_irq_init(struct platform_device *pdev)
