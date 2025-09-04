@@ -359,8 +359,8 @@ static int mtk_ccifreq_probe(struct platform_device *pdev)
 
 	passive_data->parent_type = CPUFREQ_PARENT_DEV;
 	drv->devfreq = devm_devfreq_add_device(dev, &mtk_ccifreq_profile,
-					       DEVFREQ_GOV_PASSIVE,
-					       passive_data);
+					       DEVFREQ_GOV_USERSPACE,
+					       NULL);
 	if (IS_ERR(drv->devfreq)) {
 		ret = -EPROBE_DEFER;
 		dev_err(dev, "failed to add devfreq device: %ld\n",
