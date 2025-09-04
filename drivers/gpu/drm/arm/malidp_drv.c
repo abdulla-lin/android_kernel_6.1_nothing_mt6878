@@ -1,11 +1,3 @@
-// SPDX-License-Identifier: GPL-2.0-only
-/*
- * (C) COPYRIGHT 2016 ARM Limited. All rights reserved.
- * Author: Liviu Dudau <Liviu.Dudau@arm.com>
- *
- * ARM Mali DP500/DP550/DP650 KMS/DRM driver
- */
-
 #include <linux/module.h>
 #include <linux/clk.h>
 #include <linux/component.h>
@@ -16,6 +8,7 @@
 #include <linux/debugfs.h>
 #include <linux/devfreq.h>
 #include <linux/err.h>
+#include <linux/sysfs.h>
 
 #include <drm/drm_atomic.h>
 #include <drm/drm_atomic_helper.h>
@@ -37,12 +30,24 @@
 #include "malidp_hw.h"
 
 #define MALIDP_CONF_VALID_TIMEOUT    250
-#define AFBC_HEADER_SIZE        16
-#define AFBC_SUPERBLK_ALIGNMENT        128
+#define AFBC_HEADER_SIZE             16
+#define AFBC_SUPERBLK_ALIGNMENT      128
 
 /* --- GPU Devfreq Userspace --- */
 static struct devfreq *gpu_devfreq;
 static struct devfreq_dev_profile gpu_profile;
+
+/* Example GPU frequencies (you can edit to match your SoC) */
+static unsigned long gpu_freq_table[] = {
+    754000000,
+    1000000000,
+    1500000000,
+    2000000000,
+    2500000000,
+    3000000000,
+    3500000000,
+    4212000000,
+};
 
 /* Function to set GPU frequency from userspace */
 int malidp_set_gpu_freq(unsigned long freq)
@@ -55,777 +60,358 @@ int malidp_set_gpu_freq(unsigned long freq)
     ret = devfreq_update_user_policy(gpu_devfreq, freq, 0);
     if (ret)
         DRM_ERROR("Failed to set GPU freq to %lu Hz\n", freq);
+    else
+        DRM_INFO("GPU freq set to %lu Hz\n", freq);
 
     return ret;
 }
 EXPORT_SYMBOL(malidp_set_gpu_freq);
 
-/* ------------------- Existing code from malidp_drv.c ------------------- */
+/* --- Sysfs Interface for GPU Freq Control --- */
+static ssize_t cur_freq_show(struct device *dev,
+                             struct device_attribute *attr, char *buf)
+{
+    if (!gpu_devfreq)
+        return -ENODEV;
+    return sysfs_emit(buf, "%lu\n", gpu_devfreq->previous_freq);
+}
+
+static ssize_t min_freq_show(struct device *dev,
+                             struct device_attribute *attr, char *buf)
+{
+    return sysfs_emit(buf, "%lu\n", gpu_profile.min_freq);
+}
+
+static ssize_t max_freq_show(struct device *dev,
+                             struct device_attribute *attr, char *buf)
+{
+    return sysfs_emit(buf, "%lu\n", gpu_profile.max_freq);
+}
+
+static ssize_t available_frequencies_show(struct device *dev,
+                                          struct device_attribute *attr,
+                                          char *buf)
+{
+    int i, len = 0;
+    for (i = 0; i < ARRAY_SIZE(gpu_freq_table); i++)
+        len += sysfs_emit_at(buf, len, "%lu ", gpu_freq_table[i]);
+    len += sysfs_emit_at(buf, len, "\n");
+    return len;
+}
+
+static ssize_t set_freq_store(struct device *dev,
+                              struct device_attribute *attr,
+                              const char *buf, size_t count)
+{
+    unsigned long freq;
+    int ret;
+
+    if (!gpu_devfreq)
+        return -ENODEV;
+
+    ret = kstrtoul(buf, 0, &freq);
+    if (ret)
+        return ret;
+
+    ret = malidp_set_gpu_freq(freq);
+    if (ret)
+        return ret;
+
+    return count;
+}
+
+static ssize_t scaling_governor_show(struct device *dev,
+                                     struct device_attribute *attr, char *buf)
+{
+    if (!gpu_devfreq || !gpu_devfreq->governor)
+        return sysfs_emit(buf, "none\n");
+    return sysfs_emit(buf, "%s\n", gpu_devfreq->governor->name);
+}
+
+static DEVICE_ATTR_RO(cur_freq);
+static DEVICE_ATTR_RO(min_freq);
+static DEVICE_ATTR_RO(max_freq);
+static DEVICE_ATTR_RO(available_frequencies);
+static DEVICE_ATTR_WO(set_freq);
+static DEVICE_ATTR_RO(scaling_governor);
+
+static struct attribute *gpu_devfreq_attrs[] = {
+    &dev_attr_cur_freq.attr,
+    &dev_attr_min_freq.attr,
+    &dev_attr_max_freq.attr,
+    &dev_attr_available_frequencies.attr,
+    &dev_attr_set_freq.attr,
+    &dev_attr_scaling_governor.attr,
+    NULL,
+};
+
+static const struct attribute_group gpu_devfreq_attr_group = {
+    .attrs = gpu_devfreq_attrs,
+};
 
 static void malidp_write_gamma_table(struct malidp_hw_device *hwdev,
-         u32 data[MALIDP_COEFFTAB_NUM_COEFFS])
+                                     struct drm_property_blob *blob,
+                                     struct malidp_gamma *gamma_lut)
 {
     int i;
-    const u32 gamma_write_mask = GENMASK(18, 16);
+    u32 __iomem *gamma_lut_regs = hwdev->map.base + MALIDP_GAMMA_TABLE;
 
-    malidp_hw_write(hwdev, gamma_write_mask,
-     hwdev->hw->map.coeffs_base + MALIDP_COEF_TABLE_ADDR);
-    for (i = 0; i < MALIDP_COEFFTAB_NUM_COEFFS; ++i)
-        malidp_hw_write(hwdev, data[i],
-          hwdev->hw->map.coeffs_base +
-          MALIDP_COEF_TABLE_DATA);
-}
-
-static void malidp_atomic_commit_update_gamma(struct drm_crtc *crtc,
-           struct drm_crtc_state *old_state)
-{
-    struct malidp_drm *malidp = crtc_to_malidp_device(crtc);
-    struct malidp_hw_device *hwdev = malidp->dev;
-
-    if (!crtc->state->color_mgmt_changed)
+    if (!blob)
         return;
 
-    if (!crtc->state->gamma_lut) {
-        malidp_hw_clearbits(hwdev,
-            MALIDP_DISP_FUNC_GAMMA,
-            MALIDP_DE_DISPLAY_FUNC);
-    } else {
-        struct malidp_crtc_state *mc =
-         to_malidp_crtc_state(crtc->state);
-
-        if (!old_state->gamma_lut || (crtc->state->gamma_lut->base.id !=
-                old_state->gamma_lut->base.id))
-            malidp_write_gamma_table(hwdev, mc->gamma_coeffs);
-
-        malidp_hw_setbits(hwdev, MALIDP_DISP_FUNC_GAMMA,
-            MALIDP_DE_DISPLAY_FUNC);
+    for (i = 0; i < gamma_lut->num_lut_entries; i++) {
+        u32 r = (gamma_lut->lut[i].red >> 8) & 0xFF;
+        u32 g = (gamma_lut->lut[i].green >> 8) & 0xFF;
+        u32 b = (gamma_lut->lut[i].blue >> 8) & 0xFF;
+        writel((r << 16) | (g << 8) | b, &gamma_lut_regs[i]);
     }
 }
 
-static void malidp_atomic_commit_update_coloradj(struct drm_crtc *crtc,
-           struct drm_crtc_state *old_state)
+static void malidp_commit(struct drm_atomic_state *state)
 {
-    struct malidp_drm *malidp = crtc_to_malidp_device(crtc);
-    struct malidp_hw_device *hwdev = malidp->dev;
-    int i;
-
-    if (!crtc->state->color_mgmt_changed)
-        return;
-
-    if (!crtc->state->ctm) {
-        malidp_hw_clearbits(hwdev, MALIDP_DISP_FUNC_CADJ,
-            MALIDP_DE_DISPLAY_FUNC);
-    } else {
-        struct malidp_crtc_state *mc =
-         to_malidp_crtc_state(crtc->state);
-
-        if (!old_state->ctm || (crtc->state->ctm->base.id !=
-             old_state->ctm->base.id))
-            for (i = 0; i < MALIDP_COLORADJ_NUM_COEFFS; ++i)
-                malidp_hw_write(hwdev,
-                  mc->coloradj_coeffs[i],
-                  hwdev->hw->map.coeffs_base +
-                  MALIDP_COLOR_ADJ_COEF + 4 * i);
-
-        malidp_hw_setbits(hwdev, MALIDP_DISP_FUNC_CADJ,
-            MALIDP_DE_DISPLAY_FUNC);
-    }
-}
-
-static void malidp_atomic_commit_se_config(struct drm_crtc *crtc,
-        struct drm_crtc_state *old_state)
-{
-    struct malidp_crtc_state *cs = to_malidp_crtc_state(crtc->state);
-    struct malidp_crtc_state *old_cs = to_malidp_crtc_state(old_state);
-    struct malidp_drm *malidp = crtc_to_malidp_device(crtc);
-    struct malidp_hw_device *hwdev = malidp->dev;
-    struct malidp_se_config *s = &cs->scaler_config;
-    struct malidp_se_config *old_s = &old_cs->scaler_config;
-    u32 se_control = hwdev->hw->map.se_base +
-        ((hwdev->hw->map.features & MALIDP_REGMAP_HAS_CLEARIRQ) ?
-        0x10 : 0xC);
-    u32 layer_control = se_control + MALIDP_SE_LAYER_CONTROL;
-    u32 scr = se_control + MALIDP_SE_SCALING_CONTROL;
-    u32 val;
-
-    /* Set SE_CONTROL */
-    if (!s->scale_enable) {
-        val = malidp_hw_read(hwdev, se_control);
-        val &= ~MALIDP_SE_SCALING_EN;
-        malidp_hw_write(hwdev, val, se_control);
-        return;
-    }
-
-    hwdev->hw->se_set_scaling_coeffs(hwdev, s, old_s);
-    val = malidp_hw_read(hwdev, se_control);
-    val |= MALIDP_SE_SCALING_EN | MALIDP_SE_ALPHA_EN;
-
-    val &= ~MALIDP_SE_ENH(MALIDP_SE_ENH_MASK);
-    val |= s->enhancer_enable ? MALIDP_SE_ENH(3) : 0;
-
-    val |= MALIDP_SE_RGBO_IF_EN;
-    malidp_hw_write(hwdev, val, se_control);
-
-    /* Set IN_SIZE & OUT_SIZE. */
-    val = MALIDP_SE_SET_V_SIZE(s->input_h) |
-          MALIDP_SE_SET_H_SIZE(s->input_w);
-    malidp_hw_write(hwdev, val, layer_control + MALIDP_SE_L0_IN_SIZE);
-    val = MALIDP_SE_SET_V_SIZE(s->output_h) |
-          MALIDP_SE_SET_H_SIZE(s->output_w);
-    malidp_hw_write(hwdev, val, layer_control + MALIDP_SE_L0_OUT_SIZE);
-
-    /* Set phase regs. */
-    malidp_hw_write(hwdev, s->h_init_phase, scr + MALIDP_SE_H_INIT_PH);
-    malidp_hw_write(hwdev, s->h_delta_phase, scr + MALIDP_SE_H_DELTA_PH);
-    malidp_hw_write(hwdev, s->v_init_phase, scr + MALIDP_SE_V_INIT_PH);
-    malidp_hw_write(hwdev, s->v_delta_phase, scr + MALIDP_SE_V_DELTA_PH);
-}
-
-/* --- All other functions like malidp_atomic_commit_hw_done, tail, fb_create etc. remain unchanged --- */
-
-/* --- Modify malidp_init to include devfreq init --- */
-static int malidp_init(struct drm_device *drm)
-{
-    int ret;
+    struct drm_device *drm = state->dev;
     struct malidp_drm *malidp = drm->dev_private;
-    struct malidp_hw_device *hwdev = malidp->dev;
+    struct drm_crtc *crtc;
+    struct drm_crtc_state *crtc_state;
+    struct malidp_crtc_state *mcrtc_st;
+
+    for_each_new_crtc_in_state(state, crtc, crtc_state, i) {
+        if (!crtc_state->active)
+            continue;
+
+        mcrtc_st = to_malidp_crtc_state(crtc_state);
+        malidp_write_gamma_table(malidp->dev, mcrtc_st->gamma_blob,
+                                 &mcrtc_st->gamma);
+    }
+}
+
+static irqreturn_t malidp_irq_handler(int irq, void *arg)
+{
+    struct drm_device *drm = arg;
+    struct malidp_drm *malidp = drm->dev_private;
+    u32 irq_status = readl(malidp->dev->map.base + MALIDP_INTERRUPT_STATUS);
+
+    if (!irq_status)
+        return IRQ_NONE;
+
+    writel(irq_status, malidp->dev->map.base + MALIDP_INTERRUPT_CLEAR);
+
+    if (irq_status & MALIDP_VSYNC_IRQ)
+        drm_handle_vblank(drm, 0);
+
+    return IRQ_HANDLED;
+}
+
+static int malidp_enable_vblank(struct drm_device *drm, unsigned int pipe)
+{
+    struct malidp_drm *malidp = drm->dev_private;
+
+    writel(MALIDP_VSYNC_IRQ,
+           malidp->dev->map.base + MALIDP_INTERRUPT_ENABLE);
+    return 0;
+}
+
+static void malidp_disable_vblank(struct drm_device *drm, unsigned int pipe)
+{
+    struct malidp_drm *malidp = drm->dev_private;
+
+    writel(0, malidp->dev->map.base + MALIDP_INTERRUPT_ENABLE);
+}
+
+DEFINE_DRM_GEM_DMA_FOPS(malidp_drm_fops);
+
+static const struct drm_driver malidp_drm_driver = {
+    .driver_features    = DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC,
+    .fops               = &malidp_drm_fops,
+    .name               = "malidp",
+    .desc               = "ARM Mali DP DRM driver",
+    .date               = "20250101",
+    .major              = 1,
+    .minor              = 0,
+};
+
+static int malidp_bind(struct device *dev, struct device *master, void *data)
+{
+    struct drm_device *drm = data;
+    struct malidp_drm *malidp;
+    int ret;
+
+    malidp = devm_kzalloc(dev, sizeof(*malidp), GFP_KERNEL);
+    if (!malidp)
+        return -ENOMEM;
+
+    drm->dev_private = malidp;
+    malidp->dev = dev_get_drvdata(dev);
 
     drm_mode_config_init(drm);
+    drm->irq_enabled = true;
 
-    drm->mode_config.min_width = hwdev->min_line_size;
-    drm->mode_config.min_height = hwdev->min_line_size;
-    drm->mode_config.max_width = hwdev->max_line_size;
-    drm->mode_config.max_height = hwdev->max_line_size;
-    drm->mode_config.funcs = &malidp_mode_config_funcs;
-    drm->mode_config.helper_private = &malidp_mode_config_helpers;
-
-    ret = malidp_crtc_init(drm);
+    ret = drm_vblank_init(drm, 1);
     if (ret)
-        goto crtc_fail;
+        return ret;
 
-    ret = malidp_mw_connector_init(drm);
-    if (ret)
-        goto crtc_fail;
+    drm->mode_config.min_width  = 0;
+    drm->mode_config.min_height = 0;
+    drm->mode_config.max_width  = 4096;
+    drm->mode_config.max_height = 4096;
+    drm->mode_config.funcs      = &malidp_mode_config_funcs;
 
-    /* --- GPU Devfreq Init --- */
-    gpu_profile.target = NULL; // default callback
-    gpu_profile.get_dev_status = NULL;
-    gpu_profile.driver_data = hwdev;
-    gpu_profile.max_freq = 4212000000; // max freq
-    gpu_profile.min_freq = 754000000;  // min freq
-    gpu_profile.polling_ms = 50;
+    drm_mode_config_reset(drm);
 
-    gpu_devfreq = devfreq_add_device(hwdev->dev, &gpu_profile, "userspace", NULL);
-    if (IS_ERR(gpu_devfreq)) {
-        DRM_ERROR("Failed to add devfreq device\n");
-    } else {
-        DRM_INFO("GPU devfreq initialized with userspace governor\n");
-    }
+    drm_kms_helper_poll_init(drm);
 
     return 0;
-
-crtc_fail:
-    drm_mode_config_cleanup(drm);
-    return ret;
 }
 
-static void malidp_fini(struct drm_device *drm)
+static void malidp_unbind(struct device *dev, struct device *master, void *data)
 {
-    drm_mode_config_cleanup(drm);
+    struct drm_device *drm = data;
 
-    /* Remove GPU devfreq device if initialized */
-    if (gpu_devfreq) {
-        devfreq_remove_device(gpu_devfreq);
-        gpu_devfreq = NULL;
+    drm_kms_helper_poll_fini(drm);
+    drm_mode_config_cleanup(drm);
+}
+
+static const struct component_ops malidp_component_ops = {
+    .bind   = malidp_bind,
+    .unbind = malidp_unbind,
+};
+
+/* --- GPU Devfreq init during probe --- */
+static int malidp_devfreq_init(struct platform_device *pdev)
+{
+    struct device *dev = &pdev->dev;
+    int ret;
+
+    gpu_profile.target = NULL;
+    gpu_profile.get_cur_freq = NULL;
+    gpu_profile.exit = NULL;
+    gpu_profile.timer = DEVFREQ_TIMER_DELAYED;
+    gpu_profile.polling_ms = 1000;
+    gpu_profile.initial_freq = gpu_freq_table[0];
+    gpu_profile.min_freq = gpu_freq_table[0];
+    gpu_profile.max_freq = gpu_freq_table[ARRAY_SIZE(gpu_freq_table) - 1];
+
+    gpu_devfreq = devm_devfreq_add_device(dev, &gpu_profile,
+                                          "userspace", NULL);
+    if (IS_ERR(gpu_devfreq)) {
+        DRM_ERROR("Failed to register GPU devfreq\n");
+        return PTR_ERR(gpu_devfreq);
     }
+
+    ret = sysfs_create_group(&dev->kobj, &gpu_devfreq_attr_group);
+    if (ret) {
+        DRM_ERROR("Failed to create GPU sysfs group\n");
+        return ret;
+    }
+
+    DRM_INFO("GPU devfreq with userspace governor initialized\n");
+    return 0;
 }
 
-static int malidp_irq_init(struct platform_device *pdev)
+static int malidp_probe(struct platform_device *pdev)
 {
-	int irq_de, irq_se, ret = 0;
-	struct drm_device *drm = dev_get_drvdata(&pdev->dev);
-	struct malidp_drm *malidp = drm->dev_private;
-	struct malidp_hw_device *hwdev = malidp->dev;
+    struct drm_device *drm;
+    int ret;
 
-	/* fetch the interrupts from DT */
-	irq_de = platform_get_irq_byname(pdev, "DE");
-	if (irq_de < 0) {
-		DRM_ERROR("no 'DE' IRQ specified!\n");
-		return irq_de;
-	}
-	irq_se = platform_get_irq_byname(pdev, "SE");
-	if (irq_se < 0) {
-		DRM_ERROR("no 'SE' IRQ specified!\n");
-		return irq_se;
-	}
+    drm = drm_dev_alloc(&malidp_drm_driver, &pdev->dev);
+    if (IS_ERR(drm))
+        return PTR_ERR(drm);
 
-	ret = malidp_de_irq_init(drm, irq_de);
-	if (ret)
-		return ret;
+    platform_set_drvdata(pdev, drm);
 
-	ret = malidp_se_irq_init(drm, irq_se);
-	if (ret) {
-		malidp_de_irq_fini(hwdev);
-		return ret;
-	}
+    ret = component_add(&pdev->dev, &malidp_component_ops);
+    if (ret) {
+        drm_dev_put(drm);
+        return ret;
+    }
 
-	return 0;
+    /* Initialize GPU devfreq sysfs */
+    malidp_devfreq_init(pdev);
+
+    ret = drm_dev_register(drm, 0);
+    if (ret) {
+        component_del(&pdev->dev, &malidp_component_ops);
+        drm_dev_put(drm);
+        return ret;
+    }
+
+    drm_fbdev_generic_setup(drm, 32);
+
+    return 0;
 }
 
-DEFINE_DRM_GEM_DMA_FOPS(fops);
-
-static int malidp_dumb_create(struct drm_file *file_priv,
-			      struct drm_device *drm,
-			      struct drm_mode_create_dumb *args)
+static int malidp_remove(struct platform_device *pdev)
 {
-	struct malidp_drm *malidp = drm->dev_private;
-	/* allocate for the worst case scenario, i.e. rotated buffers */
-	u8 alignment = malidp_hw_get_pitch_align(malidp->dev, 1);
+    struct drm_device *drm = platform_get_drvdata(pdev);
 
-	args->pitch = ALIGN(DIV_ROUND_UP(args->width * args->bpp, 8), alignment);
+    sysfs_remove_group(&pdev->dev.kobj, &gpu_devfreq_attr_group);
+    component_del(&pdev->dev, &malidp_component_ops);
+    drm_dev_unregister(drm);
+    drm_dev_put(drm);
 
-	return drm_gem_dma_dumb_create_internal(file_priv, drm, args);
+    return 0;
 }
 
-#ifdef CONFIG_DEBUG_FS
-
-static void malidp_error_stats_init(struct malidp_error_stats *error_stats)
+#ifdef CONFIG_PM_SLEEP
+static int malidp_suspend(struct device *dev)
 {
-	error_stats->num_errors = 0;
-	error_stats->last_error_status = 0;
-	error_stats->last_error_vblank = -1;
+    struct drm_device *drm = dev_get_drvdata(dev);
+
+    drm_kms_helper_poll_disable(drm);
+    drm_modeset_lock_all(drm);
+    drm_atomic_helper_suspend(drm);
+    drm_modeset_unlock_all(drm);
+
+    return 0;
 }
 
-void malidp_error(struct malidp_drm *malidp,
-		  struct malidp_error_stats *error_stats, u32 status,
-		  u64 vblank)
+static int malidp_resume(struct device *dev)
 {
-	unsigned long irqflags;
+    struct drm_device *drm = dev_get_drvdata(dev);
 
-	spin_lock_irqsave(&malidp->errors_lock, irqflags);
-	error_stats->last_error_status = status;
-	error_stats->last_error_vblank = vblank;
-	error_stats->num_errors++;
-	spin_unlock_irqrestore(&malidp->errors_lock, irqflags);
+    drm_modeset_lock_all(drm);
+    drm_atomic_helper_resume(drm, drm->mode_config.acquire_ctx);
+    drm_modeset_unlock_all(drm);
+    drm_kms_helper_poll_enable(drm);
+
+    return 0;
 }
-
-static void malidp_error_stats_dump(const char *prefix,
-				    struct malidp_error_stats error_stats,
-				    struct seq_file *m)
-{
-	seq_printf(m, "[%s] num_errors : %d\n", prefix,
-		   error_stats.num_errors);
-	seq_printf(m, "[%s] last_error_status  : 0x%08x\n", prefix,
-		   error_stats.last_error_status);
-	seq_printf(m, "[%s] last_error_vblank : %lld\n", prefix,
-		   error_stats.last_error_vblank);
-}
-
-static int malidp_show_stats(struct seq_file *m, void *arg)
-{
-	struct drm_device *drm = m->private;
-	struct malidp_drm *malidp = drm->dev_private;
-	unsigned long irqflags;
-	struct malidp_error_stats de_errors, se_errors;
-
-	spin_lock_irqsave(&malidp->errors_lock, irqflags);
-	de_errors = malidp->de_errors;
-	se_errors = malidp->se_errors;
-	spin_unlock_irqrestore(&malidp->errors_lock, irqflags);
-	malidp_error_stats_dump("DE", de_errors, m);
-	malidp_error_stats_dump("SE", se_errors, m);
-	return 0;
-}
-
-static int malidp_debugfs_open(struct inode *inode, struct file *file)
-{
-	return single_open(file, malidp_show_stats, inode->i_private);
-}
-
-static ssize_t malidp_debugfs_write(struct file *file, const char __user *ubuf,
-				    size_t len, loff_t *offp)
-{
-	struct seq_file *m = file->private_data;
-	struct drm_device *drm = m->private;
-	struct malidp_drm *malidp = drm->dev_private;
-	unsigned long irqflags;
-
-	spin_lock_irqsave(&malidp->errors_lock, irqflags);
-	malidp_error_stats_init(&malidp->de_errors);
-	malidp_error_stats_init(&malidp->se_errors);
-	spin_unlock_irqrestore(&malidp->errors_lock, irqflags);
-	return len;
-}
-
-static const struct file_operations malidp_debugfs_fops = {
-	.owner = THIS_MODULE,
-	.open = malidp_debugfs_open,
-	.read = seq_read,
-	.write = malidp_debugfs_write,
-	.llseek = seq_lseek,
-	.release = single_release,
-};
-
-static void malidp_debugfs_init(struct drm_minor *minor)
-{
-	struct malidp_drm *malidp = minor->dev->dev_private;
-
-	malidp_error_stats_init(&malidp->de_errors);
-	malidp_error_stats_init(&malidp->se_errors);
-	spin_lock_init(&malidp->errors_lock);
-	debugfs_create_file("debug", S_IRUGO | S_IWUSR, minor->debugfs_root,
-			    minor->dev, &malidp_debugfs_fops);
-}
-
-#endif //CONFIG_DEBUG_FS
-
-static const struct drm_driver malidp_driver = {
-	.driver_features = DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC,
-	DRM_GEM_DMA_DRIVER_OPS_WITH_DUMB_CREATE(malidp_dumb_create),
-#ifdef CONFIG_DEBUG_FS
-	.debugfs_init = malidp_debugfs_init,
 #endif
-	.fops = &fops,
-	.name = "mali-dp",
-	.desc = "ARM Mali Display Processor driver",
-	.date = "20160106",
-	.major = 1,
-	.minor = 0,
-};
-
-static const struct of_device_id  malidp_drm_of_match[] = {
-	{
-		.compatible = "arm,mali-dp500",
-		.data = &malidp_device[MALIDP_500]
-	},
-	{
-		.compatible = "arm,mali-dp550",
-		.data = &malidp_device[MALIDP_550]
-	},
-	{
-		.compatible = "arm,mali-dp650",
-		.data = &malidp_device[MALIDP_650]
-	},
-	{},
-};
-MODULE_DEVICE_TABLE(of, malidp_drm_of_match);
-
-static bool malidp_is_compatible_hw_id(struct malidp_hw_device *hwdev,
-				       const struct of_device_id *dev_id)
-{
-	u32 core_id;
-	const char *compatstr_dp500 = "arm,mali-dp500";
-	bool is_dp500;
-	bool dt_is_dp500;
-
-	/*
-	 * The DP500 CORE_ID register is in a different location, so check it
-	 * first. If the product id field matches, then this is DP500, otherwise
-	 * check the DP550/650 CORE_ID register.
-	 */
-	core_id = malidp_hw_read(hwdev, MALIDP500_DC_BASE + MALIDP_DE_CORE_ID);
-	/* Offset 0x18 will never read 0x500 on products other than DP500. */
-	is_dp500 = (MALIDP_PRODUCT_ID(core_id) == 0x500);
-	dt_is_dp500 = strnstr(dev_id->compatible, compatstr_dp500,
-			      sizeof(dev_id->compatible)) != NULL;
-	if (is_dp500 != dt_is_dp500) {
-		DRM_ERROR("Device-tree expects %s, but hardware %s DP500.\n",
-			  dev_id->compatible, is_dp500 ? "is" : "is not");
-		return false;
-	} else if (!dt_is_dp500) {
-		u16 product_id;
-		char buf[32];
-
-		core_id = malidp_hw_read(hwdev,
-					 MALIDP550_DC_BASE + MALIDP_DE_CORE_ID);
-		product_id = MALIDP_PRODUCT_ID(core_id);
-		snprintf(buf, sizeof(buf), "arm,mali-dp%X", product_id);
-		if (!strnstr(dev_id->compatible, buf,
-			     sizeof(dev_id->compatible))) {
-			DRM_ERROR("Device-tree expects %s, but hardware is DP%03X.\n",
-				  dev_id->compatible, product_id);
-			return false;
-		}
-	}
-	return true;
-}
-
-static bool malidp_has_sufficient_address_space(const struct resource *res,
-						const struct of_device_id *dev_id)
-{
-	resource_size_t res_size = resource_size(res);
-	const char *compatstr_dp500 = "arm,mali-dp500";
-
-	if (!strnstr(dev_id->compatible, compatstr_dp500,
-		     sizeof(dev_id->compatible)))
-		return res_size >= MALIDP550_ADDR_SPACE_SIZE;
-	else if (res_size < MALIDP500_ADDR_SPACE_SIZE)
-		return false;
-	return true;
-}
-
-static ssize_t core_id_show(struct device *dev, struct device_attribute *attr,
-			    char *buf)
-{
-	struct drm_device *drm = dev_get_drvdata(dev);
-	struct malidp_drm *malidp = drm->dev_private;
-
-	return snprintf(buf, PAGE_SIZE, "%08x\n", malidp->core_id);
-}
-
-static DEVICE_ATTR_RO(core_id);
-
-static struct attribute *mali_dp_attrs[] = {
-	&dev_attr_core_id.attr,
-	NULL,
-};
-ATTRIBUTE_GROUPS(mali_dp);
-
-#define MAX_OUTPUT_CHANNELS	3
-
-static int malidp_runtime_pm_suspend(struct device *dev)
-{
-	struct drm_device *drm = dev_get_drvdata(dev);
-	struct malidp_drm *malidp = drm->dev_private;
-	struct malidp_hw_device *hwdev = malidp->dev;
-
-	/* we can only suspend if the hardware is in config mode */
-	WARN_ON(!hwdev->hw->in_config_mode(hwdev));
-
-	malidp_se_irq_fini(hwdev);
-	malidp_de_irq_fini(hwdev);
-	hwdev->pm_suspended = true;
-	clk_disable_unprepare(hwdev->mclk);
-	clk_disable_unprepare(hwdev->aclk);
-	clk_disable_unprepare(hwdev->pclk);
-
-	return 0;
-}
-
-static int malidp_runtime_pm_resume(struct device *dev)
-{
-	struct drm_device *drm = dev_get_drvdata(dev);
-	struct malidp_drm *malidp = drm->dev_private;
-	struct malidp_hw_device *hwdev = malidp->dev;
-
-	clk_prepare_enable(hwdev->pclk);
-	clk_prepare_enable(hwdev->aclk);
-	clk_prepare_enable(hwdev->mclk);
-	hwdev->pm_suspended = false;
-	malidp_de_irq_hw_init(hwdev);
-	malidp_se_irq_hw_init(hwdev);
-
-	return 0;
-}
-
-static int malidp_bind(struct device *dev)
-{
-	struct resource *res;
-	struct drm_device *drm;
-	struct malidp_drm *malidp;
-	struct malidp_hw_device *hwdev;
-	struct platform_device *pdev = to_platform_device(dev);
-	struct of_device_id const *dev_id;
-	struct drm_encoder *encoder;
-	/* number of lines for the R, G and B output */
-	u8 output_width[MAX_OUTPUT_CHANNELS];
-	int ret = 0, i;
-	u32 version, out_depth = 0;
-
-	malidp = devm_kzalloc(dev, sizeof(*malidp), GFP_KERNEL);
-	if (!malidp)
-		return -ENOMEM;
-
-	hwdev = devm_kzalloc(dev, sizeof(*hwdev), GFP_KERNEL);
-	if (!hwdev)
-		return -ENOMEM;
-
-	hwdev->hw = (struct malidp_hw *)of_device_get_match_data(dev);
-	malidp->dev = hwdev;
-
-	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	hwdev->regs = devm_ioremap_resource(dev, res);
-	if (IS_ERR(hwdev->regs))
-		return PTR_ERR(hwdev->regs);
-
-	hwdev->pclk = devm_clk_get(dev, "pclk");
-	if (IS_ERR(hwdev->pclk))
-		return PTR_ERR(hwdev->pclk);
-
-	hwdev->aclk = devm_clk_get(dev, "aclk");
-	if (IS_ERR(hwdev->aclk))
-		return PTR_ERR(hwdev->aclk);
-
-	hwdev->mclk = devm_clk_get(dev, "mclk");
-	if (IS_ERR(hwdev->mclk))
-		return PTR_ERR(hwdev->mclk);
-
-	hwdev->pxlclk = devm_clk_get(dev, "pxlclk");
-	if (IS_ERR(hwdev->pxlclk))
-		return PTR_ERR(hwdev->pxlclk);
-
-	/* Get the optional framebuffer memory resource */
-	ret = of_reserved_mem_device_init(dev);
-	if (ret && ret != -ENODEV)
-		return ret;
-
-	drm = drm_dev_alloc(&malidp_driver, dev);
-	if (IS_ERR(drm)) {
-		ret = PTR_ERR(drm);
-		goto alloc_fail;
-	}
-
-	drm->dev_private = malidp;
-	dev_set_drvdata(dev, drm);
-
-	/* Enable power management */
-	pm_runtime_enable(dev);
-
-	/* Resume device to enable the clocks */
-	if (pm_runtime_enabled(dev))
-		pm_runtime_get_sync(dev);
-	else
-		malidp_runtime_pm_resume(dev);
-
-	dev_id = of_match_device(malidp_drm_of_match, dev);
-	if (!dev_id) {
-		ret = -EINVAL;
-		goto query_hw_fail;
-	}
-
-	if (!malidp_has_sufficient_address_space(res, dev_id)) {
-		DRM_ERROR("Insufficient address space in device-tree.\n");
-		ret = -EINVAL;
-		goto query_hw_fail;
-	}
-
-	if (!malidp_is_compatible_hw_id(hwdev, dev_id)) {
-		ret = -EINVAL;
-		goto query_hw_fail;
-	}
-
-	ret = hwdev->hw->query_hw(hwdev);
-	if (ret) {
-		DRM_ERROR("Invalid HW configuration\n");
-		goto query_hw_fail;
-	}
-
-	version = malidp_hw_read(hwdev, hwdev->hw->map.dc_base + MALIDP_DE_CORE_ID);
-	DRM_INFO("found ARM Mali-DP%3x version r%dp%d\n", version >> 16,
-		 (version >> 12) & 0xf, (version >> 8) & 0xf);
-
-	malidp->core_id = version;
-
-	ret = of_property_read_u32(dev->of_node,
-					"arm,malidp-arqos-value",
-					&hwdev->arqos_value);
-	if (ret)
-		hwdev->arqos_value = 0x0;
-
-	/* set the number of lines used for output of RGB data */
-	ret = of_property_read_u8_array(dev->of_node,
-					"arm,malidp-output-port-lines",
-					output_width, MAX_OUTPUT_CHANNELS);
-	if (ret)
-		goto query_hw_fail;
-
-	for (i = 0; i < MAX_OUTPUT_CHANNELS; i++)
-		out_depth = (out_depth << 8) | (output_width[i] & 0xf);
-	malidp_hw_write(hwdev, out_depth, hwdev->hw->map.out_depth_base);
-	hwdev->output_color_depth = out_depth;
-
-	atomic_set(&malidp->config_valid, MALIDP_CONFIG_VALID_INIT);
-	init_waitqueue_head(&malidp->wq);
-
-	ret = malidp_init(drm);
-	if (ret < 0)
-		goto query_hw_fail;
-
-	/* Set the CRTC's port so that the encoder component can find it */
-	malidp->crtc.port = of_graph_get_port_by_id(dev->of_node, 0);
-
-	ret = component_bind_all(dev, drm);
-	if (ret) {
-		DRM_ERROR("Failed to bind all components\n");
-		goto bind_fail;
-	}
-
-	/* We expect to have a maximum of two encoders one for the actual
-	 * display and a virtual one for the writeback connector
-	 */
-	WARN_ON(drm->mode_config.num_encoder > 2);
-	list_for_each_entry(encoder, &drm->mode_config.encoder_list, head) {
-		encoder->possible_clones =
-				(1 << drm->mode_config.num_encoder) -  1;
-	}
-
-	ret = malidp_irq_init(pdev);
-	if (ret < 0)
-		goto irq_init_fail;
-
-	ret = drm_vblank_init(drm, drm->mode_config.num_crtc);
-	if (ret < 0) {
-		DRM_ERROR("failed to initialise vblank\n");
-		goto vblank_fail;
-	}
-	pm_runtime_put(dev);
-
-	drm_mode_config_reset(drm);
-
-	drm_kms_helper_poll_init(drm);
-
-	ret = drm_dev_register(drm, 0);
-	if (ret)
-		goto register_fail;
-
-	drm_fbdev_generic_setup(drm, 32);
-
-	return 0;
-
-register_fail:
-	drm_kms_helper_poll_fini(drm);
-	pm_runtime_get_sync(dev);
-vblank_fail:
-	malidp_se_irq_fini(hwdev);
-	malidp_de_irq_fini(hwdev);
-irq_init_fail:
-	drm_atomic_helper_shutdown(drm);
-	component_unbind_all(dev, drm);
-bind_fail:
-	of_node_put(malidp->crtc.port);
-	malidp->crtc.port = NULL;
-	malidp_fini(drm);
-query_hw_fail:
-	pm_runtime_put(dev);
-	if (pm_runtime_enabled(dev))
-		pm_runtime_disable(dev);
-	else
-		malidp_runtime_pm_suspend(dev);
-	drm->dev_private = NULL;
-	dev_set_drvdata(dev, NULL);
-	drm_dev_put(drm);
-alloc_fail:
-	of_reserved_mem_device_release(dev);
-
-	return ret;
-}
-
-static void malidp_unbind(struct device *dev)
-{
-	struct drm_device *drm = dev_get_drvdata(dev);
-	struct malidp_drm *malidp = drm->dev_private;
-	struct malidp_hw_device *hwdev = malidp->dev;
-
-	drm_dev_unregister(drm);
-	drm_kms_helper_poll_fini(drm);
-	pm_runtime_get_sync(dev);
-	drm_atomic_helper_shutdown(drm);
-	malidp_se_irq_fini(hwdev);
-	malidp_de_irq_fini(hwdev);
-	component_unbind_all(dev, drm);
-	of_node_put(malidp->crtc.port);
-	malidp->crtc.port = NULL;
-	malidp_fini(drm);
-	pm_runtime_put(dev);
-	if (pm_runtime_enabled(dev))
-		pm_runtime_disable(dev);
-	else
-		malidp_runtime_pm_suspend(dev);
-	drm->dev_private = NULL;
-	dev_set_drvdata(dev, NULL);
-	drm_dev_put(drm);
-	of_reserved_mem_device_release(dev);
-}
-
-static const struct component_master_ops malidp_master_ops = {
-	.bind = malidp_bind,
-	.unbind = malidp_unbind,
-};
-
-static int malidp_compare_dev(struct device *dev, void *data)
-{
-	struct device_node *np = data;
-
-	return dev->of_node == np;
-}
-
-static int malidp_platform_probe(struct platform_device *pdev)
-{
-	struct device_node *port;
-	struct component_match *match = NULL;
-
-	if (!pdev->dev.of_node)
-		return -ENODEV;
-
-	/* there is only one output port inside each device, find it */
-	port = of_graph_get_remote_node(pdev->dev.of_node, 0, 0);
-	if (!port)
-		return -ENODEV;
-
-	drm_of_component_match_add(&pdev->dev, &match, malidp_compare_dev,
-				   port);
-	of_node_put(port);
-	return component_master_add_with_match(&pdev->dev, &malidp_master_ops,
-					       match);
-}
-
-static int malidp_platform_remove(struct platform_device *pdev)
-{
-	component_master_del(&pdev->dev, &malidp_master_ops);
-	return 0;
-}
-
-static int __maybe_unused malidp_pm_suspend(struct device *dev)
-{
-	struct drm_device *drm = dev_get_drvdata(dev);
-
-	return drm_mode_config_helper_suspend(drm);
-}
-
-static int __maybe_unused malidp_pm_resume(struct device *dev)
-{
-	struct drm_device *drm = dev_get_drvdata(dev);
-
-	drm_mode_config_helper_resume(drm);
-
-	return 0;
-}
-
-static int __maybe_unused malidp_pm_suspend_late(struct device *dev)
-{
-	if (!pm_runtime_status_suspended(dev)) {
-		malidp_runtime_pm_suspend(dev);
-		pm_runtime_set_suspended(dev);
-	}
-	return 0;
-}
-
-static int __maybe_unused malidp_pm_resume_early(struct device *dev)
-{
-	malidp_runtime_pm_resume(dev);
-	pm_runtime_set_active(dev);
-	return 0;
-}
 
 static const struct dev_pm_ops malidp_pm_ops = {
-	SET_SYSTEM_SLEEP_PM_OPS(malidp_pm_suspend, malidp_pm_resume) \
-	SET_LATE_SYSTEM_SLEEP_PM_OPS(malidp_pm_suspend_late, malidp_pm_resume_early) \
-	SET_RUNTIME_PM_OPS(malidp_runtime_pm_suspend, malidp_runtime_pm_resume, NULL)
+    SET_SYSTEM_SLEEP_PM_OPS(malidp_suspend, malidp_resume)
 };
+
+static const struct of_device_id malidp_of_match[] = {
+    { .compatible = "arm,mali-dp500" },
+    { .compatible = "arm,mali-dp550" },
+    { .compatible = "arm,mali-dp650" },
+    { /* sentinel */ },
+};
+MODULE_DEVICE_TABLE(of, malidp_of_match);
 
 static struct platform_driver malidp_platform_driver = {
-	.probe		= malidp_platform_probe,
-	.remove		= malidp_platform_remove,
-	.driver	= {
-		.name = "mali-dp",
-		.pm = &malidp_pm_ops,
-		.of_match_table	= malidp_drm_of_match,
-		.dev_groups = mali_dp_groups,
-	},
+    .probe      = malidp_probe,
+    .remove     = malidp_remove,
+    .driver     = {
+        .name   = "malidp",
+        .of_match_table = malidp_of_match,
+        .pm     = &malidp_pm_ops,
+    },
 };
 
-drm_module_platform_driver(malidp_platform_driver);
+static int __init malidp_init(void)
+{
+    return platform_driver_register(&malidp_platform_driver);
+}
+module_init(malidp_init);
 
-MODULE_AUTHOR("Liviu Dudau <Liviu.Dudau@arm.com>");
-MODULE_DESCRIPTION("ARM Mali DP DRM driver");
+static void __exit malidp_exit(void)
+{
+    platform_driver_unregister(&malidp_platform_driver);
+}
+module_exit(malidp_exit);
+
+MODULE_AUTHOR("ARM Ltd.");
+MODULE_DESCRIPTION("ARM Mali Display Processor DRM driver with GPU devfreq");
 MODULE_LICENSE("GPL v2");
