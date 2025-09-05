@@ -61,7 +61,6 @@
 #include <asm/io.h>
 #include <linux/random.h>
 #include <linux/ktime.h>
-#endif
 /*********************************************************************
  *
  * Initialization and readiness waiting.
