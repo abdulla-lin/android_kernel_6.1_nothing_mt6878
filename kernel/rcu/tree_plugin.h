@@ -13,6 +13,7 @@
 
 #include "../locking/rtmutex_common.h"
 
+static bool rcu_lazy = true;
 static bool rcu_rdp_is_offloaded(struct rcu_data *rdp)
 {
 	/*
@@ -285,15 +286,23 @@ static void rcu_preempt_ctxt_queue(struct rcu_node *rnp, struct rcu_data *rdp)
  */
 static void rcu_qs(void)
 {
-	RCU_LOCKDEP_WARN(preemptible(), "rcu_qs() invoked with preemption enabled!!!\n");
-	if (__this_cpu_read(rcu_data.cpu_no_qs.b.norm)) {
-		trace_rcu_grace_period(TPS("rcu_preempt"),
-				       __this_cpu_read(rcu_data.gp_seq),
-				       TPS("cpuqs"));
-		__this_cpu_write(rcu_data.cpu_no_qs.b.norm, false);
-		barrier(); /* Coordinate with rcu_flavor_sched_clock_irq(). */
-		WRITE_ONCE(current->rcu_read_unlock_special.b.need_qs, false);
-	}
+    RCU_LOCKDEP_WARN(preemptible(),
+        "rcu_qs() invoked with preemption enabled!!!\n");
+
+    if (__this_cpu_read(rcu_data.cpu_no_qs.b.norm)) {
+        if (rcu_lazy) {
+            __this_cpu_write(rcu_data.cpu_no_qs.b.norm, false);
+            WRITE_ONCE(current->rcu_read_unlock_special.b.need_qs, false);
+            return;
+        }
+
+        trace_rcu_grace_period(TPS("rcu_preempt"),
+                               __this_cpu_read(rcu_data.gp_seq),
+                               TPS("cpuqs"));
+        __this_cpu_write(rcu_data.cpu_no_qs.b.norm, false);
+        barrier();
+        WRITE_ONCE(current->rcu_read_unlock_special.b.need_qs, false);
+    }
 }
 
 /*
