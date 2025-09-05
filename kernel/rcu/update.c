@@ -100,6 +100,7 @@ module_param(rcu_normal_after_boot, int, 0444);
  * Similarly, we avoid claiming an RCU read lock held if the current
  * CPU is offline.
  */
+bool rcu_lazy __read_mostly = true;
 static bool rcu_read_lock_held_common(bool *ret)
 {
 	if (!debug_lockdep_rcu_enabled()) {
