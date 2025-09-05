@@ -61,12 +61,6 @@
 #include <asm/io.h>
 #include <linux/random.h>
 #include <linux/ktime.h>
-static void __init chick_rng_tweak(void)
-{
-    pr_info("ChickKernel: RNG pool optimized\n");
-    prandom_seed_fast(ktime_get_ns()); // faster seeding
-}
-early_initcall(chick_rng_tweak);
 #endif
 /*********************************************************************
  *
