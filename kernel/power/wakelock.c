@@ -22,6 +22,24 @@
 
 #include "power.h"
 
+/* ChickKernel tweak: block specific wakelocks to save power */
+static const char *chick_blocked_wakelocks[] = {
+    "com.android.server.telecom:wake",
+    "android:alarm",
+    NULL
+};
+
+static inline bool chick_should_block_wakelock(const char *name, size_t len)
+{
+    const char **wl = chick_blocked_wakelocks;
+    while (*wl) {
+        if (strncmp(*wl, name, len) == 0)
+            return true; // block this wakelock
+        wl++;
+    }
+    return false;
+}
+
 static DEFINE_MUTEX(wakelocks_lock);
 
 struct wakelock {
@@ -226,6 +244,13 @@ int pm_wake_lock(const char *buf)
 	}
 
 	mutex_lock(&wakelocks_lock);
+
+	/* ChickKernel: block specific wakelocks */
+	if (chick_should_block_wakelock(buf, len)) {
+		pr_info("ChickKernel: blocked wakelock %.*s\n", (int)len, buf);
+		mutex_unlock(&wakelocks_lock);
+		return 0; // skip acquiring
+	}
 
 	wl = wakelock_lookup_add(buf, len, true);
 	if (IS_ERR(wl)) {
